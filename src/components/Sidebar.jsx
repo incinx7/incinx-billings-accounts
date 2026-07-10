@@ -50,7 +50,7 @@ export default function Sidebar({ mobileOpen, onCloseMobile, onLock }) {
           ${mobileOpen ? 'translate-x-0' : '-translate-x-full'}`}
       >
         <div className="flex items-center justify-between border-b border-white/[0.08] px-5 py-4">
-          <img src="/logo.jpg" alt="INCINX" className="h-7 w-auto rounded" />
+         <img src="/logo.jpg" alt="INCINX" className="h-7 w-auto object-contain" />
           <button className="text-white/40 hover:text-white/80 md:hidden" onClick={onCloseMobile}>
             <X size={18} />
           </button>
