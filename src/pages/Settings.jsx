@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { Image, QrCode, PenTool, Trash2, Save, Lock } from 'lucide-react';
+import { Image, QrCode, PenTool, Trash2, Save, Lock, ScanSearch, AlertTriangle, CheckCircle2, Database, Search } from 'lucide-react';
 import { useDB } from '../context/DBContext.jsx';
 import { supabase } from '../lib/supabaseClient.js';
+import { scanForDuplicates, dedupeDB } from '../lib/dedupe.js';
 import Button from '../components/ui/Button.jsx';
 import { Field, Input, Textarea } from '../components/ui/Field.jsx';
 
@@ -130,6 +131,68 @@ export default function Settings() {
             <Button onClick={changePassword}>Update Password</Button>
           </div>
         </div>
+
+        <DataMaintenanceCard />
+      </div>
+    </div>
+  );
+}
+
+function DataMaintenanceCard() {
+  const { DB, updateDB } = useDB();
+  const [scanResult, setScanResult] = useState(null); // { report, total } | null
+  const [cleaning, setCleaning] = useState(false);
+  const [done, setDone] = useState('');
+
+  function scan() {
+    const result = scanForDuplicates(DB);
+    setScanResult(result);
+    setDone('');
+  }
+
+  async function cleanUp() {
+    if (!scanResult || scanResult.total === 0) return;
+    if (!confirm(`Remove ${scanResult.total} duplicate entries across ${Object.keys(scanResult.report).length} section(s)? This will re-sync your data to Supabase right after.`)) return;
+    setCleaning(true);
+    const cleaned = dedupeDB(DB);
+    updateDB(() => cleaned);
+    setCleaning(false);
+    setScanResult(null);
+    setDone(`Removed duplicates. Watch the sync indicator at the top — once it says "Synced," refresh the page to confirm.`);
+  }
+
+  return (
+    <div className="overflow-hidden rounded-xl border border-ink/10 bg-white shadow-card dark:border-white/10 dark:bg-noir-soft">
+      <div className="flex items-center gap-2 border-b border-ink/10 px-5 py-3.5 text-[13px] font-semibold text-ink dark:border-white/10 dark:text-white">
+        <Database size={14} /> Data Maintenance
+      </div>
+      <div className="flex flex-col gap-3 p-5">
+        <div className="text-xs text-ink/50 dark:text-white/45">
+          If invoices, clients, or other records ever show up duplicated (e.g. after a sync issue), scan here first — nothing is deleted until you confirm.
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" onClick={scan}><Search size={13} /> Scan for Duplicates</Button>
+          {scanResult && scanResult.total > 0 && (
+            <Button size="sm" variant="primary" onClick={cleanUp} disabled={cleaning}>
+              <Trash2 size={13} /> {cleaning ? 'Cleaning…' : `Remove ${scanResult.total} Duplicates`}
+            </Button>
+          )}
+        </div>
+        {scanResult && (
+          scanResult.total === 0 ? (
+            <div className="text-xs text-emerald-600 dark:text-emerald-400">No duplicates found — your data looks clean.</div>
+          ) : (
+            <div className="rounded-lg border border-brass-400/30 bg-brass-50 p-3 text-xs text-brass-700 dark:border-brass-400/20 dark:bg-brass-500/10 dark:text-brass-400">
+              Found {scanResult.total} duplicate entr{scanResult.total === 1 ? 'y' : 'ies'}:
+              <ul className="mt-1 list-disc pl-4">
+                {Object.entries(scanResult.report).map(([section, count]) => (
+                  <li key={section}>{section}: {count} duplicate{count === 1 ? '' : 's'}</li>
+                ))}
+              </ul>
+            </div>
+          )
+        )}
+        {done && <div className="text-xs text-emerald-600 dark:text-emerald-400">{done}</div>}
       </div>
     </div>
   );

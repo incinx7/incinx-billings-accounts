@@ -1,7 +1,7 @@
-// Data sync helpers for the app's own data (the `app_data` table).
-// These now go through the authenticated Supabase client (see
-// supabaseClient.js), so Row Level Security can require a logged-in
-// session instead of trusting the bare anon key for everything.
+// Data layer for the 13-table Supabase architecture (one table per
+// section, e.g. `invoices`, `clients`, `expenses`...) instead of the
+// original single `app_data` table. Each table is expected to have
+// columns: id (any type, auto-generated), data (jsonb), created_at.
 
 import { supabase } from './supabaseClient.js';
 
@@ -9,38 +9,73 @@ export const supabaseConfigured = Boolean(
   import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY
 );
 
-/** Loads all rows from app_data and reassembles them into the DB shape. */
+const tableMap = {
+  clients: 'clients',
+  expenses: 'expenses',
+  expo: 'expo',
+  gstBills: 'gst_bills',
+  informal: 'informal',
+  invoices: 'invoices',
+  petty: 'petty_cash',
+  pin: 'pin',
+  proforma: 'proforma',
+  projects: 'projects',
+  quotations: 'quotations',
+  settings: 'settings',
+  vendors: 'vendors',
+};
+
 export async function supabaseLoad(emptyDbShape) {
   if (!supabaseConfigured) return null;
-  const { data: rows, error } = await supabase.from('app_data').select('section,data').limit(1000);
-  if (error) throw error;
-
   const db = structuredClone(emptyDbShape);
-  (rows || []).forEach((row) => {
-    if (Array.isArray(db[row.section])) db[row.section].push(row.data);
-    else db[row.section] = row.data;
-  });
+
+  for (const [dbKey, tableName] of Object.entries(tableMap)) {
+    const { data: rows, error } = await supabase
+      .from(tableName)
+      .select('id,data,created_at')
+      .order('id', { ascending: true });
+
+    if (error) {
+      // Surface this instead of silently skipping — a silently-skipped
+      // section (e.g. from a missing RLS policy) looks identical to
+      // "genuinely empty," which is exactly what caused the earlier
+      // confusion. Better to fail loudly and know immediately.
+      throw new Error(`Failed to load "${tableName}": ${error.message}`);
+    }
+
+    if (Array.isArray(emptyDbShape[dbKey])) {
+      db[dbKey] = (rows || []).map((row) => row.data);
+    } else {
+      db[dbKey] = rows?.[0]?.data ?? emptyDbShape[dbKey];
+    }
+  }
   return db;
 }
 
-/** Saves the full DB object back to Supabase, one bulk request per section. */
 export async function supabaseSave(DB) {
   if (!supabaseConfigured) return;
-  for (const section of Object.keys(DB)) {
-    const data = DB[section];
-    const { error: delErr } = await supabase.from('app_data').delete().eq('section', section);
-    if (delErr) throw new Error(`Failed to clear "${section}" before saving: ${delErr.message}`);
 
-    if (Array.isArray(data)) {
-      if (data.length === 0) continue;
-      const rows = data.map((item) => ({ section, data: item }));
-      // Single bulk insert instead of one request per row — far fewer round
-      // trips, and no risk of a partial save if one row in a long loop fails.
-      const { error } = await supabase.from('app_data').insert(rows);
-      if (error) throw new Error(`Failed to save "${section}" (${rows.length} item(s)): ${error.message}`);
+  for (const [dbKey, tableName] of Object.entries(tableMap)) {
+    const value = DB[dbKey];
+
+    // Delete-all that works regardless of the id column's type
+    // (bigint, uuid, text, ...) — every real row has a non-null id.
+    const { error: delErr } = await supabase
+      .from(tableName)
+      .delete()
+      .not('id', 'is', null);
+    if (delErr) {
+      throw new Error(`Failed to clear "${tableName}" before saving: ${delErr.message}`);
+    }
+
+    if (Array.isArray(value)) {
+      if (value.length === 0) continue;
+      const rows = value.map((item) => ({ data: item }));
+      const { error } = await supabase.from(tableName).insert(rows);
+      if (error) throw new Error(`Failed to save "${tableName}" (${rows.length} item(s)): ${error.message}`);
     } else {
-      const { error } = await supabase.from('app_data').insert({ section, data });
-      if (error) throw new Error(`Failed to save "${section}": ${error.message}`);
+      const { error } = await supabase.from(tableName).insert([{ data: value }]);
+      if (error) throw new Error(`Failed to save "${tableName}": ${error.message}`);
     }
   }
 }

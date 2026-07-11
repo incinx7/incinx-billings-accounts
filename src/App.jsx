@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Routes, Route } from 'react-router-dom';
+import { DBProvider } from './context/DBContext.jsx';
 import PinScreen from './components/PinScreen.jsx';
 import Layout from './components/Layout.jsx';
 
@@ -25,22 +26,24 @@ export default function App() {
   }
 
   return (
-    <Routes>
-      <Route element={<Layout onLock={() => setUnlocked(false)} />}>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/invoices" element={<Invoices />} />
-        <Route path="/quotations" element={<Quotations />} />
-        <Route path="/proforma" element={<Proforma />} />
-        <Route path="/expenses" element={<Expenses />} />
-        <Route path="/petty" element={<Petty />} />
-        <Route path="/clients" element={<Clients />} />
-        <Route path="/vendors" element={<Vendors />} />
-        <Route path="/projects" element={<Projects />} />
-        <Route path="/tracker" element={<Tracker />} />
-        <Route path="/informal" element={<Informal />} />
-        <Route path="/reports" element={<Reports />} />
-        <Route path="/settings" element={<Settings />} />
-      </Route>
-    </Routes>
+    <DBProvider>
+      <Routes>
+        <Route element={<Layout onLock={() => setUnlocked(false)} />}>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/invoices" element={<Invoices />} />
+          <Route path="/quotations" element={<Quotations />} />
+          <Route path="/proforma" element={<Proforma />} />
+          <Route path="/expenses" element={<Expenses />} />
+          <Route path="/petty" element={<Petty />} />
+          <Route path="/clients" element={<Clients />} />
+          <Route path="/vendors" element={<Vendors />} />
+          <Route path="/projects" element={<Projects />} />
+          <Route path="/tracker" element={<Tracker />} />
+          <Route path="/informal" element={<Informal />} />
+          <Route path="/reports" element={<Reports />} />
+          <Route path="/settings" element={<Settings />} />
+        </Route>
+      </Routes>
+    </DBProvider>
   );
 }

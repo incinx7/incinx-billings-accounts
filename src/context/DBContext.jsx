@@ -3,7 +3,6 @@ import { supabaseLoad, supabaseSave, supabaseConfigured } from '../lib/supabase'
 
 const DB_KEY = 'incinx_v2';
 
-// Same default shape as the original app's `DB` object.
 export function emptyDB() {
   return {
     invoices: [], clients: [], vendors: [], projects: [], expenses: [], petty: [],
@@ -29,14 +28,15 @@ export function DBProvider({ children }) {
       return emptyDB();
     }
   });
+
   const [syncStatus, setSyncStatus] = useState('idle'); // idle | syncing | error
   const saveTimer = useRef(null);
-  const pendingSave = useRef(false); // true whenever a save is queued OR in flight
-  const lastGoodDB = useRef(null);
+  const pendingSave = useRef(false);
   const didInitialLoad = useRef(false);
 
-  // On first mount, try to pull the latest from Supabase (source of truth
-  // across devices), falling back silently to whatever's in localStorage.
+  // This now only ever mounts after login is confirmed (see App.jsx), so
+  // there's no longer a race between "is the user logged in yet" and
+  // "try to load their data."
   useEffect(() => {
     if (didInitialLoad.current) return;
     didInitialLoad.current = true;
@@ -47,7 +47,6 @@ export function DBProvider({ children }) {
         const remote = await supabaseLoad(emptyDB());
         if (remote) {
           setDB(remote);
-          lastGoodDB.current = remote;
           localStorage.setItem(DB_KEY, JSON.stringify(remote));
         }
         setSyncStatus('idle');
@@ -58,10 +57,6 @@ export function DBProvider({ children }) {
     })();
   }, []);
 
-  // Warn before closing/reloading if a save hasn't finished yet — this is
-  // what stops a fast reload from silently losing the last change (the app
-  // would otherwise fetch from Supabase before that save landed, and
-  // overwrite the newer local copy with the older remote one).
   useEffect(() => {
     function handler(e) {
       if (pendingSave.current) {
@@ -78,7 +73,6 @@ export function DBProvider({ children }) {
     try {
       setSyncStatus('syncing');
       await supabaseSave(nextDB);
-      lastGoodDB.current = nextDB;
       setSyncStatus('idle');
     } catch (e) {
       console.error('Supabase save failed', e);
@@ -88,10 +82,6 @@ export function DBProvider({ children }) {
     }
   }, []);
 
-  // Persist to localStorage immediately. The Supabase push is only briefly
-  // debounced (just enough to coalesce rapid successive edits) — not the
-  // 600ms delay this used to have, which was long enough for a quick
-  // reload to slip through before the save ever left the browser.
   const persist = useCallback((nextDB) => {
     try { localStorage.setItem(DB_KEY, JSON.stringify(nextDB)); } catch { /* ignore quota errors */ }
     pendingSave.current = true;
@@ -99,7 +89,6 @@ export function DBProvider({ children }) {
     saveTimer.current = setTimeout(() => runSave(nextDB), 150);
   }, [runSave]);
 
-  /** Retries the last save immediately — used by the sync-error indicator. */
   const retrySync = useCallback(() => {
     const raw = localStorage.getItem(DB_KEY);
     if (!raw) return;
@@ -110,7 +99,6 @@ export function DBProvider({ children }) {
     } catch { /* ignore */ }
   }, [runSave]);
 
-  /** Update the DB. Accepts either a new object or an updater function, React-setState style. */
   const updateDB = useCallback((updater) => {
     setDB((prev) => {
       const next = typeof updater === 'function' ? updater(prev) : updater;
