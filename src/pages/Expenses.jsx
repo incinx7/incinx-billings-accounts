@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
-import { Wallet, Plus, Pencil, Trash2, CreditCard, X as XIcon } from 'lucide-react';
+import { Wallet, Plus, Pencil, Trash2, CreditCard, X as XIcon, FileText, Wrench } from 'lucide-react';
 import { useDB } from '../context/DBContext.jsx';
 import { fmt, fmtDate, todayISO, uid } from '../lib/utils.js';
+import { printVendorStatement } from '../lib/vendorStatement.js';
 import Modal from '../components/ui/Modal.jsx';
 import Button from '../components/ui/Button.jsx';
 import { Field, Input, Select, Textarea } from '../components/ui/Field.jsx';
@@ -37,12 +38,14 @@ function computeGST(amt, vtype, gstRate, gstInclusive) {
 
 export default function Expenses() {
   const { DB, updateDB } = useDB();
+  const [view, setView] = useState('list'); // list | vendor
+  const [vendorFilter, setVendorFilter] = useState('');
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [modalOpen, setModalOpen] = useState(false);
   const [editIdx, setEditIdx] = useState(null);
   const [form, setForm] = useState(emptyExpense());
-  const [payForm, setPayForm] = useState(null);
+  const [payForm, setPayForm] = useState(null); // { amt, date, mode, paidBy, ref }
 
   const withStatus = DB.expenses.map((e) => ({ ...e, ...computeStatus(e.amt, e.paymentSplits) }));
 
@@ -100,7 +103,7 @@ export default function Expenses() {
     setForm((f) => ({ ...f, paymentSplits: (f.paymentSplits || []).filter((p) => p.id !== id) }));
   }
 
-  const { bal: formBal, status: formStatus } = computeStatus(form.amt, form.paymentSplits);
+  const { paid: formPaid, bal: formBal, status: formStatus } = computeStatus(form.amt, form.paymentSplits);
   const { gstAmt: formGstAmt } = computeGST(form.amt, form.vtype, form.gstRate, form.gstInclusive);
 
   const statusBadgeClass = (st) => ({
@@ -111,6 +114,15 @@ export default function Expenses() {
 
   return (
     <div>
+      <div className="mb-5 flex border-b border-ink/10 dark:border-white/10">
+        <button onClick={() => setView('list')} className={`px-4 py-2 text-[13px] font-medium border-b-2 -mb-px transition-colors ${view === 'list' ? 'border-brass-500 text-ink dark:text-white' : 'border-transparent text-ink/40 dark:text-white/40'}`}>Expenses</button>
+        <button onClick={() => setView('vendor')} className={`px-4 py-2 text-[13px] font-medium border-b-2 -mb-px transition-colors ${view === 'vendor' ? 'border-brass-500 text-ink dark:text-white' : 'border-transparent text-ink/40 dark:text-white/40'}`}>Vendor Payments</button>
+      </div>
+
+      {view === 'vendor' ? (
+        <VendorPaymentsView DB={DB} vendorFilter={vendorFilter} setVendorFilter={setVendorFilter} />
+      ) : (
+      <>
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatCard label="Total Expenses" value={`₹${fmt(totalAmt)}`} sub={`${DB.expenses.length} entries`} />
         <StatCard label="Paid" value={`₹${fmt(totalPaid)}`} tone="green" />
@@ -192,6 +204,8 @@ export default function Expenses() {
           </div>
         )}
       </div>
+      </>
+      )}
 
       <Modal
         open={modalOpen}
@@ -312,6 +326,105 @@ function StatCard({ label, value, sub, tone }) {
       <div className="font-mono text-[10px] font-medium uppercase tracking-wider text-ink/40 dark:text-white/40">{label}</div>
       <div className={`mt-1.5 font-serif text-2xl ${toneClass}`}>{value}</div>
       {sub && <div className="mt-1 text-[11px] text-ink/40 dark:text-white/35">{sub}</div>}
+    </div>
+  );
+}
+
+function VendorPaymentsView({ DB, vendorFilter, setVendorFilter }) {
+  // Vendor names come from both the saved Vendors list and any free-typed
+  // vendor names used on expenses, so nothing gets missed either way.
+  const vendorNames = useMemo(() => {
+    const set = new Set();
+    DB.vendors.forEach((v) => (v.biz || v.name) && set.add(v.biz || v.name));
+    DB.expenses.forEach((e) => e.vendor && set.add(e.vendor));
+    return Array.from(set).sort();
+  }, [DB.vendors, DB.expenses]);
+
+  const vendorExpenses = vendorFilter ? DB.expenses.filter((e) => e.vendor === vendorFilter) : [];
+
+  const totalBilled = vendorExpenses.reduce((s, e) => s + (parseFloat(e.amt) || 0), 0);
+  const totalPaid = vendorExpenses.reduce((s, e) => s + (e.paymentSplits || []).reduce((s2, p) => s2 + (parseFloat(p.amt) || 0), 0), 0);
+  const totalPending = totalBilled - totalPaid;
+
+  const statusBadgeClass = (st) => ({
+    paid: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400',
+    partial: 'bg-brass-50 text-brass-600 dark:bg-brass-500/10 dark:text-brass-400',
+    unpaid: 'bg-rose-50 text-rose-600 dark:bg-rose-500/10 dark:text-rose-400',
+  }[st]);
+
+  return (
+    <div>
+      <div className="overflow-hidden rounded-xl border border-ink/10 bg-white shadow-card dark:border-white/10 dark:bg-noir-soft">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-ink/10 px-5 py-3.5 dark:border-white/10">
+          <div className="text-[13px] font-semibold text-ink dark:text-white">Vendor Payment Report</div>
+          {vendorFilter && (
+            <Button variant="primary" size="sm" onClick={() => printVendorStatement(vendorFilter, vendorExpenses, DB.settings)}>
+              <FileText size={13} /> Print / Download PDF
+            </Button>
+          )}
+        </div>
+        <div className="p-5">
+          <Field label="Select Vendor">
+            <Select value={vendorFilter} onChange={(e) => setVendorFilter(e.target.value)}>
+              <option value="">— Select a vendor —</option>
+              {vendorNames.map((name) => <option key={name} value={name}>{name}</option>)}
+            </Select>
+          </Field>
+        </div>
+      </div>
+
+      {vendorFilter && (
+        <>
+          <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <StatCard label="Total Billed" value={`₹${fmt(totalBilled)}`} sub={`${vendorExpenses.length} records`} />
+            <StatCard label="Total Paid" value={`₹${fmt(totalPaid)}`} tone="green" />
+            <StatCard label="Pending" value={`₹${fmt(totalPending)}`} tone={totalPending > 0 ? 'amber' : 'green'} />
+          </div>
+
+          <div className="mt-5 overflow-hidden rounded-xl border border-ink/10 bg-white shadow-card dark:border-white/10 dark:bg-noir-soft">
+            {vendorExpenses.length === 0 ? (
+              <div className="flex flex-col items-center gap-2 px-6 py-16 text-center">
+                <Wrench size={26} strokeWidth={1.5} className="text-ink/30 dark:text-white/30" />
+                <div className="text-[13px] text-ink/45 dark:text-white/45">No expense records for this vendor yet.</div>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-[13px]">
+                  <thead>
+                    <tr className="border-b border-ink/10 text-[10px] uppercase tracking-wider text-ink/40 dark:border-white/10 dark:text-white/35">
+                      <th className="px-5 py-2.5 font-medium">Date</th>
+                      <th className="px-5 py-2.5 font-medium">Description</th>
+                      <th className="px-5 py-2.5 font-medium">Category</th>
+                      <th className="px-5 py-2.5 font-medium">Billed</th>
+                      <th className="px-5 py-2.5 font-medium">Paid</th>
+                      <th className="px-5 py-2.5 font-medium">Pending</th>
+                      <th className="px-5 py-2.5 font-medium">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {vendorExpenses.slice().sort((a, b) => (a.date || '').localeCompare(b.date || '')).map((e, idx) => {
+                      const paid = (e.paymentSplits || []).reduce((s, p) => s + (parseFloat(p.amt) || 0), 0);
+                      const bal = Math.max(0, (parseFloat(e.amt) || 0) - paid);
+                      const status = paid <= 0 ? 'unpaid' : bal <= 0 ? 'paid' : 'partial';
+                      return (
+                        <tr key={idx} className="border-b border-ink/5 last:border-0 dark:border-white/5">
+                          <td className="px-5 py-2.5 font-mono text-xs text-ink/70 dark:text-white/70">{fmtDate(e.date)}</td>
+                          <td className="px-5 py-2.5 text-ink/70 dark:text-white/70">{e.desc}</td>
+                          <td className="px-5 py-2.5 text-ink/70 dark:text-white/70">{e.cat}</td>
+                          <td className="px-5 py-2.5 text-ink/70 dark:text-white/70">₹{fmt(e.amt)}</td>
+                          <td className="px-5 py-2.5 text-emerald-600 dark:text-emerald-400">₹{fmt(paid)}</td>
+                          <td className="px-5 py-2.5 text-rose-600 dark:text-rose-400">₹{fmt(bal)}</td>
+                          <td className="px-5 py-2.5"><span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${statusBadgeClass(status)}`}>{status}</span></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }
