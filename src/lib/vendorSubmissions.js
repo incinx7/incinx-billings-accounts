@@ -2,7 +2,7 @@ import { supabase } from './supabaseClient.js';
 
 export async function fetchVendorSubmissions() {
   const { data, error } = await supabase
-    .from('vendors')
+    .from('vendor_submissions')
     .select('id, data, created_at')
     .order('created_at', { ascending: false });
   if (error) throw error;
@@ -11,14 +11,14 @@ export async function fetchVendorSubmissions() {
 
 export async function markSubmissionStatus(id, status, currentData) {
   const { error } = await supabase
-    .from('vendors')
+    .from('vendor_submissions')
     .update({ data: { ...currentData, status } })
     .eq('id', id);
   if (error) throw error;
 }
 
 export async function deleteSubmission(id) {
-  const { error } = await supabase.from('vendors').delete().eq('id', id);
+  const { error } = await supabase.from('vendor_submissions').delete().eq('id', id);
   if (error) throw error;
 }
 
