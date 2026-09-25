@@ -139,3 +139,39 @@ export function calcT(items, gstType, adv) {
   const igst = gstType === 'inter' ? tax : 0;
   return { subtotal: sub, totalTax: tax, cgst, sgst, igst, total: sub + tax - (adv || 0) };
 }
+
+/**
+ * Derives GST-report-ready "bill" entries from Expense records.
+ *
+ * Only expenses where the vendor is GST-registered (vtype === 'gst') AND
+ * a bill copy has actually been uploaded (billFile) are included — a
+ * GST-registered vendor with no bill attached yet is left out until the
+ * bill is uploaded, and Non-GST vendor bills never appear here at all.
+ *
+ * Shared by Reports.jsx (on-screen list) and caGstReport.js (CA PDF) so
+ * both stay in sync automatically as expenses are added/edited.
+ */
+export function expenseGstBills(expenses) {
+  return (expenses || [])
+    .map((e, i) => ({ e, i }))
+    .filter(({ e }) => e.vtype === 'gst' && e.billFile)
+    .map(({ e, i }) => {
+      const amt = parseFloat(e.amt) || 0;
+      const rate = e.gstRate || 18;
+      let baseAmt = amt, gstAmt = 0;
+      if (e.gstInclusive === 'inclusive') {
+        baseAmt = amt / (1 + rate / 100);
+        gstAmt = amt - baseAmt;
+      } else {
+        gstAmt = amt * (rate / 100);
+      }
+      return {
+        vendor: e.vendor, gst: e.vgst, pan: e.vpan, billNo: e.billno,
+        billDate: e.date, billMonth: (e.date || '').slice(0, 7),
+        taxableAmt: baseAmt, gstAmt, amount: amt,
+        type: e.billFile.wasPdf ? 'application/pdf' : 'image/jpeg',
+        data: e.billFile.dataUrl, name: e.billFile.name,
+        expenseIndex: i,
+      };
+    });
+}

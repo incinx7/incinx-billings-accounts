@@ -1,8 +1,10 @@
-import { useMemo, useState } from 'react';
-import { Wallet, Plus, Pencil, Trash2, CreditCard, X as XIcon, FileText, Wrench } from 'lucide-react';
+import { useMemo, useRef, useState } from 'react';
+import { Wallet, Plus, Pencil, Trash2, CreditCard, X as XIcon, FileText, Wrench, Eye, Download, Upload, Paperclip, FileX } from 'lucide-react';
 import { useDB } from '../context/DBContext.jsx';
 import { fmt, fmtDate, todayISO, uid } from '../lib/utils.js';
 import { printVendorStatement } from '../lib/vendorStatement.js';
+import { compressBillFile } from '../lib/fileCompress.js';
+import JSZip from 'jszip';
 import Modal from '../components/ui/Modal.jsx';
 import Button from '../components/ui/Button.jsx';
 import { Field, Input, Select, Textarea } from '../components/ui/Field.jsx';
@@ -16,7 +18,23 @@ function emptyExpense() {
     vendor: '', vcontact: '', vpan: '', vgst: '', vtype: 'nogst',
     gstRate: 18, gstBillingType: 'intra', gstInclusive: 'inclusive',
     notes: '', paymentSplits: [], projectLabel: '',
+    billFile: null,
   };
+}
+
+/** Opens a stored bill (compressed JPEG data URL) in a new tab. */
+function viewBill(billFile) {
+  if (!billFile) return;
+  window.open(billFile.dataUrl, '_blank');
+}
+
+/** Downloads a stored bill to disk. */
+function downloadBill(billFile) {
+  if (!billFile) return;
+  const a = document.createElement('a');
+  a.href = billFile.dataUrl;
+  a.download = billFile.name || 'bill.jpg';
+  a.click();
 }
 
 function computeStatus(amt, splits) {
@@ -46,6 +64,8 @@ export default function Expenses() {
   const [editIdx, setEditIdx] = useState(null);
   const [form, setForm] = useState(emptyExpense());
   const [payForm, setPayForm] = useState(null); // { amt, date, mode, paidBy, ref }
+  const [compressingBill, setCompressingBill] = useState(false);
+  const billInputRef = useRef(null);
 
   const withStatus = DB.expenses.map((e) => ({ ...e, ...computeStatus(e.amt, e.paymentSplits) }));
 
@@ -103,6 +123,30 @@ export default function Expenses() {
     setForm((f) => ({ ...f, paymentSplits: (f.paymentSplits || []).filter((p) => p.id !== id) }));
   }
 
+  async function handleBillUpload(e) {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-selecting the same file later
+    if (!file) return;
+    if (!file.type.startsWith('image/') && file.type !== 'application/pdf') {
+      alert('Please upload an image or PDF file.');
+      return;
+    }
+    setCompressingBill(true);
+    try {
+      const compressed = await compressBillFile(file);
+      setForm((f) => ({ ...f, billFile: { ...compressed, uploadDate: todayISO() } }));
+    } catch (err) {
+      console.error(err);
+      alert('Could not process that file — try a different image or PDF.');
+    } finally {
+      setCompressingBill(false);
+    }
+  }
+
+  function removeBillFile() {
+    setForm((f) => ({ ...f, billFile: null }));
+  }
+
   const { paid: formPaid, bal: formBal, status: formStatus } = computeStatus(form.amt, form.paymentSplits);
   const { gstAmt: formGstAmt } = computeGST(form.amt, form.vtype, form.gstRate, form.gstInclusive);
 
@@ -117,9 +161,12 @@ export default function Expenses() {
       <div className="mb-5 flex border-b border-ink/10 dark:border-white/10">
         <button onClick={() => setView('list')} className={`px-4 py-2 text-[13px] font-medium border-b-2 -mb-px transition-colors ${view === 'list' ? 'border-brass-500 text-ink dark:text-white' : 'border-transparent text-ink/40 dark:text-white/40'}`}>Expenses</button>
         <button onClick={() => setView('vendor')} className={`px-4 py-2 text-[13px] font-medium border-b-2 -mb-px transition-colors ${view === 'vendor' ? 'border-brass-500 text-ink dark:text-white' : 'border-transparent text-ink/40 dark:text-white/40'}`}>Vendor Payments</button>
+        <button onClick={() => setView('bills')} className={`px-4 py-2 text-[13px] font-medium border-b-2 -mb-px transition-colors ${view === 'bills' ? 'border-brass-500 text-ink dark:text-white' : 'border-transparent text-ink/40 dark:text-white/40'}`}>Vendor Bills</button>
       </div>
 
-      {view === 'vendor' ? (
+      {view === 'bills' ? (
+        <BillsArchiveView DB={DB} />
+      ) : view === 'vendor' ? (
         <VendorPaymentsView DB={DB} vendorFilter={vendorFilter} setVendorFilter={setVendorFilter} />
       ) : (
       <>
@@ -169,6 +216,7 @@ export default function Expenses() {
                   <th className="px-5 py-2.5 font-medium">Vendor</th>
                   <th className="px-5 py-2.5 font-medium">Amount</th>
                   <th className="px-5 py-2.5 font-medium">Status</th>
+                  <th className="px-5 py-2.5 font-medium">Bill</th>
                   <th className="px-5 py-2.5 font-medium">Actions</th>
                 </tr>
               </thead>
@@ -192,7 +240,21 @@ export default function Expenses() {
                       </span>
                     </td>
                     <td className="px-5 py-3">
+                      {e.billFile ? (
+                        <button onClick={() => viewBill(e.billFile)} className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-500/10 dark:text-emerald-400 dark:hover:bg-emerald-500/20">
+                          <Paperclip size={11} /> Attached
+                        </button>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-500 dark:bg-rose-500/10 dark:text-rose-400/80">
+                          <FileX size={11} /> No bill
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-5 py-3">
                       <div className="flex items-center gap-1.5">
+                        {e.billFile && (
+                          <Button size="sm" variant="ghost" onClick={() => downloadBill(e.billFile)} title="Download bill"><Download size={14} /></Button>
+                        )}
                         <Button size="sm" variant="ghost" onClick={() => openEdit(i)}><Pencil size={14} /></Button>
                         <Button size="sm" variant="danger" onClick={() => remove(i)}><Trash2 size={14} /></Button>
                       </div>
@@ -269,6 +331,32 @@ export default function Expenses() {
               </Field>
               <Field label="GST Amount (calculated)"><Input readOnly disabled value={`₹${fmt(formGstAmt)}`} /></Field>
             </>
+          )}
+        </div>
+
+        <div className="mt-6 mb-3 border-b border-ink/10 pb-2 font-mono text-[10px] uppercase tracking-wider text-ink/45 dark:border-white/10 dark:text-white/40">Bill Copy</div>
+        <div className="rounded-lg border border-ink/10 bg-[#FAFAF8] p-4 dark:border-white/10 dark:bg-black/20">
+          {form.billFile ? (
+            <div className="flex items-center gap-3">
+              <img src={form.billFile.dataUrl} alt="Bill" className="h-16 w-16 flex-shrink-0 rounded-lg border border-ink/10 object-cover dark:border-white/10" />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-xs font-medium text-ink dark:text-white">{form.billFile.name}</div>
+                <div className="text-[11px] text-ink/40 dark:text-white/35">~{form.billFile.sizeKB} KB{form.billFile.wasPdf ? ' · converted from PDF' : ''}</div>
+              </div>
+              <Button size="sm" onClick={() => viewBill(form.billFile)}><Eye size={14} /> View</Button>
+              <Button size="sm" onClick={() => downloadBill(form.billFile)}><Download size={14} /></Button>
+              <Button size="sm" variant="danger" onClick={removeBillFile}><Trash2 size={14} /></Button>
+            </div>
+          ) : compressingBill ? (
+            <div className="text-xs text-ink/50 dark:text-white/45">Compressing bill…</div>
+          ) : (
+            <div className="flex items-center gap-3">
+              <Button size="sm" variant="primary" onClick={() => billInputRef.current?.click()}>
+                <Upload size={14} /> Upload Bill Copy
+              </Button>
+              <span className="text-[11px] text-ink/40 dark:text-white/35">Image or PDF — any vendor, GST or not</span>
+              <input ref={billInputRef} type="file" accept="image/*,.pdf" className="hidden" onChange={handleBillUpload} />
+            </div>
           )}
         </div>
 
@@ -425,6 +513,136 @@ function VendorPaymentsView({ DB, vendorFilter, setVendorFilter }) {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function BillsArchiveView({ DB }) {
+  const [gstFilter, setGstFilter] = useState('all'); // all | gst | nogst
+  const [vendorFilter, setVendorFilter] = useState('');
+  const [zipping, setZipping] = useState(false);
+
+  const vendorNames = useMemo(() => {
+    const set = new Set();
+    DB.expenses.forEach((e) => e.billFile && e.vendor && set.add(e.vendor));
+    return Array.from(set).sort();
+  }, [DB.expenses]);
+
+  const bills = useMemo(() => {
+    return DB.expenses
+      .map((e, idx) => ({ e, idx }))
+      .filter(({ e }) => e.billFile)
+      .filter(({ e }) => gstFilter === 'all' || e.vtype === gstFilter)
+      .filter(({ e }) => !vendorFilter || e.vendor === vendorFilter)
+      .sort((a, b) => (b.e.date || '').localeCompare(a.e.date || ''));
+  }, [DB.expenses, gstFilter, vendorFilter]);
+
+  async function downloadAllAsZip() {
+    if (bills.length === 0) return;
+    setZipping(true);
+    try {
+      const zip = new JSZip();
+      const usedNames = new Set();
+      bills.forEach(({ e }, i) => {
+        const safeVendor = (e.vendor || 'vendor').replace(/[^a-z0-9]+/gi, '_');
+        const ext = (e.billFile.name || '').match(/\.\w+$/)?.[0] || '.jpg';
+        let filename = `${safeVendor}_${e.date || 'nodate'}${ext}`;
+        if (usedNames.has(filename)) filename = `${safeVendor}_${e.date || 'nodate'}_${i + 1}${ext}`;
+        usedNames.add(filename);
+        const base64 = e.billFile.dataUrl.split(',')[1];
+        zip.file(filename, base64, { base64: true });
+      });
+      const blob = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `vendor-bills-${todayISO()}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error(err);
+      alert('Could not build the ZIP file — please try again.');
+    } finally {
+      setZipping(false);
+    }
+  }
+
+  return (
+    <div>
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
+        <StatCard label="Total Bills" value={bills.length} />
+        <StatCard label="GST Bills" value={DB.expenses.filter((e) => e.billFile && e.vtype === 'gst').length} tone="green" />
+        <StatCard label="Non-GST Bills" value={DB.expenses.filter((e) => e.billFile && e.vtype === 'nogst').length} tone="amber" />
+      </div>
+
+      <div className="mt-5 overflow-hidden rounded-xl border border-ink/10 bg-white shadow-card dark:border-white/10 dark:bg-noir-soft">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-ink/10 px-5 py-3.5 dark:border-white/10">
+          <div className="text-[13px] font-semibold text-ink dark:text-white">Vendor Bills Archive</div>
+          <div className="flex items-center gap-2">
+            <Select value={gstFilter} onChange={(e) => setGstFilter(e.target.value)} className="!w-auto py-1.5 text-xs">
+              <option value="all">All Bills</option>
+              <option value="gst">GST Registered</option>
+              <option value="nogst">Non-GST</option>
+            </Select>
+            <Select value={vendorFilter} onChange={(e) => setVendorFilter(e.target.value)} className="!w-auto py-1.5 text-xs">
+              <option value="">All Vendors</option>
+              {vendorNames.map((name) => <option key={name} value={name}>{name}</option>)}
+            </Select>
+            <Button variant="primary" size="sm" onClick={downloadAllAsZip} disabled={zipping || bills.length === 0}>
+              <Download size={14} /> {zipping ? 'Zipping…' : `Download All (${bills.length})`}
+            </Button>
+          </div>
+        </div>
+
+        {bills.length === 0 ? (
+          <div className="flex flex-col items-center gap-3 px-6 py-16 text-center">
+            <Paperclip size={28} strokeWidth={1.5} className="text-ink/30 dark:text-white/30" />
+            <div className="text-[13px] text-ink/45 dark:text-white/45">No bills match this filter.</div>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-[13px]">
+              <thead>
+                <tr className="border-b border-ink/10 text-[10px] uppercase tracking-wider text-ink/40 dark:border-white/10 dark:text-white/35">
+                  <th className="px-5 py-2.5 font-medium">Date</th>
+                  <th className="px-5 py-2.5 font-medium">Vendor</th>
+                  <th className="px-5 py-2.5 font-medium">Project</th>
+                  <th className="px-5 py-2.5 font-medium">Amount</th>
+                  <th className="px-5 py-2.5 font-medium">Type</th>
+                  <th className="px-5 py-2.5 font-medium">Bill File</th>
+                  <th className="px-5 py-2.5 font-medium">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {bills.map(({ e, idx }) => (
+                  <tr key={idx} className="border-b border-ink/5 last:border-0 dark:border-white/5">
+                    <td className="px-5 py-2.5 font-mono text-xs text-ink/70 dark:text-white/70">{fmtDate(e.date)}</td>
+                    <td className="px-5 py-2.5 text-ink/70 dark:text-white/70">{e.vendor || '—'}</td>
+                    <td className="px-5 py-2.5 text-ink/70 dark:text-white/70">{e.projectLabel || '—'}</td>
+                    <td className="px-5 py-2.5 text-ink/70 dark:text-white/70">₹{fmt(e.amt)}</td>
+                    <td className="px-5 py-2.5">
+                      <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${e.vtype === 'gst' ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400' : 'bg-ink/5 text-ink/50 dark:bg-white/10 dark:text-white/45'}`}>
+                        {e.vtype === 'gst' ? 'GST' : 'Non-GST'}
+                      </span>
+                    </td>
+                    <td className="px-5 py-2.5 text-xs text-ink/50 dark:text-white/40">{e.billFile.name} <span className="text-ink/30 dark:text-white/25">(~{e.billFile.sizeKB}KB)</span></td>
+                    <td className="px-5 py-2.5">
+                      <div className="flex items-center gap-1.5">
+                        <Button size="sm" variant="ghost" onClick={() => viewBill(e.billFile)} title="View bill"><Eye size={14} /></Button>
+                        <Button size="sm" variant="ghost" onClick={() => downloadBill(e.billFile)} title="Download bill"><Download size={14} /></Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="mt-3 text-[11px] text-ink/35 dark:text-white/30">
+        Only GST-registered vendor bills are counted in the GST filing report — Non-GST bills stay here for your own records but won't appear there.
+      </div>
     </div>
   );
 }

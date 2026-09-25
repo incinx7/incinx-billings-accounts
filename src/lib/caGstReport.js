@@ -2,7 +2,7 @@
 // layout/CSS as your original — dark section headers, summary stat boxes,
 // net-GST highlight box, A4 landscape print.
 
-import { fmt, fmtDate } from './utils.js';
+import { fmt, fmtDate, expenseGstBills } from './utils.js';
 
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const MONTH_NAMES_FULL = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
@@ -36,7 +36,9 @@ export function printCAGSTReport(DB, caMonth) {
       source: e.type === 'travel' ? 'Travel' : 'Petty Cash',
     }));
 
-  const allGstBills = [...gstBills, ...pettyGstBills];
+  const allGstBills = [...gstBills, ...expenseGstBills(DB.expenses)
+    .filter((b) => caMonth === 'all' || (b.billDate && b.billDate.slice(0, 7) === caMonth))
+    .map((b) => ({ ...b, source: 'Vendor Bill' })), ...pettyGstBills];
 
   if (gstInv.length === 0 && allGstBills.length === 0) {
     alert('No GST client invoices or vendor GST bills found for ' + monthLabel + '.\n\nMake sure:\n• Client invoices have GST registered client type\n• Vendor GST bills have matching bill dates');

@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from 'react';
-import { FileBarChart2, Upload, Plus, Pencil, Trash2, Download, ScanLine, AlertTriangle, Database, FileText } from 'lucide-react';
+import { FileBarChart2, Upload, Plus, Pencil, Trash2, Download, ScanLine, AlertTriangle, Database, FileText, Eye, Link2 } from 'lucide-react';
 import { useDB } from '../context/DBContext.jsx';
-import { fmt, fmtDate, todayISO, dlCSV, netReceivable } from '../lib/utils.js';
+import { fmt, fmtDate, todayISO, dlCSV, netReceivable, expenseGstBills } from '../lib/utils.js';
 import { ocrImage } from '../lib/ocr.js';
 import { pdfFirstPageToImage } from '../lib/pdfToImage.js';
 import { parseBillText } from '../lib/billParse.js';
@@ -20,6 +20,11 @@ function monthLabel(ym) {
   if (!ym || ym === 'all') return 'All Time';
   const [y, m] = ym.split('-');
   return MONTH_NAMES[parseInt(m, 10) - 1] + ' ' + y;
+}
+
+function viewBill(b) {
+  if (!b?.data) return;
+  window.open(b.data, '_blank');
 }
 
 export default function Reports() {
@@ -53,7 +58,12 @@ export default function Reports() {
   const totalExpenses = filtExp.reduce((s, e) => s + (parseFloat(e.amt) || 0), 0) + informalPassThrough;
   const netProfit = paidRevenue - totalExpenses;
 
-  const gstBills = DB.gstBills || [];
+  const manualGstBills = DB.gstBills || [];
+  const linkedGstBills = useMemo(() => expenseGstBills(DB.expenses), [DB.expenses]);
+  const gstBills = useMemo(() => [
+    ...manualGstBills.map((b, i) => ({ ...b, _origin: 'manual', _manualIdx: i })),
+    ...linkedGstBills.map((b) => ({ ...b, _origin: 'expense' })),
+  ], [manualGstBills, linkedGstBills]);
   const billsByMonth = useMemo(() => {
     const groups = {};
     gstBills.forEach((b, i) => {
@@ -131,8 +141,8 @@ export default function Reports() {
   }
 
   function deleteAllBills() {
-    if (gstBills.length === 0) return;
-    if (!confirm(`Delete ALL ${gstBills.length} bill(s)? This cannot be undone.`)) return;
+    if (manualGstBills.length === 0) return;
+    if (!confirm(`Delete ALL ${manualGstBills.length} manually-added bill(s)? This cannot be undone. (Bills linked from Expenses aren't affected — remove those from the Expenses page.)`)) return;
     updateDB((prev) => ({ ...prev, gstBills: [] }));
   }
 
@@ -265,12 +275,12 @@ export default function Reports() {
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-ink/10 px-5 py-3.5 dark:border-white/10">
           <div>
             <div className="text-[13px] font-semibold text-ink dark:text-white">Vendor GST Bills</div>
-            <div className="text-xs text-ink/40 dark:text-white/35">Free on-device OCR scans bill images for GSTIN, amounts &amp; date — review before saving</div>
+            <div className="text-xs text-ink/40 dark:text-white/35">Free on-device OCR scans bill images for GSTIN, amounts &amp; date — review before saving. GST-registered vendor bills uploaded on the Expenses page are pulled in here automatically.</div>
           </div>
           <div className="flex items-center gap-2">
             <Button size="sm" onClick={() => { setEditIdx(null); setManualModal(emptyBill()); }}><Plus size={13} /> Add Manually</Button>
             <Button size="sm" variant="primary" onClick={() => fileInputRef.current?.click()}><ScanLine size={13} /> Upload &amp; Scan</Button>
-            {gstBills.length > 0 && <Button size="sm" variant="danger" onClick={deleteAllBills}><Trash2 size={13} /> Delete All</Button>}
+            {manualGstBills.length > 0 && <Button size="sm" variant="danger" onClick={deleteAllBills}><Trash2 size={13} /> Delete All</Button>}
             <input ref={fileInputRef} type="file" accept="image/*,.pdf" multiple className="hidden" onChange={(e) => handleFiles(e.target.files)} />
           </div>
         </div>
@@ -310,7 +320,14 @@ export default function Reports() {
                         <tr key={i} className="border-b border-ink/5 last:border-0 dark:border-white/5">
                           <td className="px-5 py-2.5">
                             <div className="font-medium text-ink dark:text-white">{b.vendor || '(no name)'}</div>
-                            <div className="font-mono text-[11px] text-ink/40 dark:text-white/35">{b.gst || 'no GSTIN'} {b.billNo ? '· #' + b.billNo : ''}</div>
+                            <div className="flex items-center gap-1.5 font-mono text-[11px] text-ink/40 dark:text-white/35">
+                              <span>{b.gst || 'no GSTIN'} {b.billNo ? '· #' + b.billNo : ''}</span>
+                              {b._origin === 'expense' && (
+                                <span className="inline-flex items-center gap-0.5 rounded-full bg-blue-50 px-1.5 py-0.5 text-[9px] font-sans font-medium normal-case text-blue-600 dark:bg-blue-500/10 dark:text-blue-400" title="Linked from an Expense entry — edit or remove it there">
+                                  <Link2 size={9} /> from Expenses
+                                </span>
+                              )}
+                            </div>
                           </td>
                           <td className="px-5 py-2.5 font-mono text-xs text-ink/60 dark:text-white/55">{b.billDate ? fmtDate(b.billDate) : '—'}</td>
                           <td className="px-5 py-2.5 text-right text-ink/70 dark:text-white/70">₹{fmt(b.taxableAmt)}</td>
@@ -318,8 +335,14 @@ export default function Reports() {
                           <td className="px-5 py-2.5 text-right font-medium text-ink dark:text-white">₹{fmt(b.amount)}</td>
                           <td className="px-5 py-2.5">
                             <div className="flex justify-end gap-1">
-                              <Button size="sm" variant="ghost" onClick={() => { setEditIdx(i); setManualModal({ ...b }); }}><Pencil size={13} /></Button>
-                              <Button size="sm" variant="danger" onClick={() => deleteBill(i)}><Trash2 size={13} /></Button>
+                              {b._origin === 'expense' ? (
+                                <Button size="sm" variant="ghost" onClick={() => viewBill(b)} title="View bill"><Eye size={13} /></Button>
+                              ) : (
+                                <>
+                                  <Button size="sm" variant="ghost" onClick={() => { setEditIdx(b._manualIdx); setManualModal({ ...b }); }}><Pencil size={13} /></Button>
+                                  <Button size="sm" variant="danger" onClick={() => deleteBill(b._manualIdx)}><Trash2 size={13} /></Button>
+                                </>
+                              )}
                             </div>
                           </td>
                         </tr>

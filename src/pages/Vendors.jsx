@@ -16,6 +16,17 @@ function emptyVendor() {
   };
 }
 
+/**
+ * Identity key used to spot duplicate submissions/vendors: prefer PAN
+ * (unique per person/business), fall back to mobile number. Two rows with
+ * the same key are almost certainly the same vendor submitted twice.
+ */
+function identityKey(d) {
+  const pan = (d.pan || '').trim().toUpperCase();
+  const mobile = (d.mobile || '').replace(/\D/g, '');
+  return pan || mobile || (d.name || '').trim().toLowerCase();
+}
+
 export default function Vendors() {
   const { DB, updateDB } = useDB();
   const [search, setSearch] = useState('');
@@ -34,6 +45,24 @@ export default function Vendors() {
 
   const pendingSubs = submissions.filter((s) => (s.data?.status || 'pending') === 'pending');
 
+  // Group pending submissions by identity so exact re-submissions (the
+  // "shows up twice" bug) collapse into one row in the UI, newest first.
+  const pendingGroups = useMemo(() => {
+    const byKey = new Map();
+    for (const sub of pendingSubs) {
+      const key = identityKey(sub.data || {});
+      const list = byKey.get(key) || [];
+      list.push(sub);
+      byKey.set(key, list);
+    }
+    return Array.from(byKey.values()).map((list) => {
+      list.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      return { primary: list[0], duplicates: list.slice(1) };
+    });
+  }, [pendingSubs]);
+
+  const duplicateCount = pendingGroups.reduce((n, g) => n + g.duplicates.length, 0);
+
   async function loadSubmissions() {
     setSubsLoading(true);
     setSubsError('');
@@ -48,6 +77,26 @@ export default function Vendors() {
   }
 
   useEffect(() => { loadSubmissions(); }, []);
+
+  // Vendors already saved more than once (from past duplicate approvals) —
+  // keep the first occurrence of each identity, flag the rest.
+  const duplicateVendorIdx = useMemo(() => {
+    const seen = new Set();
+    const dupIdx = [];
+    DB.vendors.forEach((v, i) => {
+      const key = identityKey(v);
+      if (seen.has(key)) dupIdx.push(i);
+      else seen.add(key);
+    });
+    return dupIdx;
+  }, [DB.vendors]);
+
+  function removeDuplicateVendors() {
+    if (duplicateVendorIdx.length === 0) return;
+    if (!confirm(`Remove ${duplicateVendorIdx.length} duplicate vendor record(s)? The earliest copy of each vendor is kept.`)) return;
+    const dupSet = new Set(duplicateVendorIdx);
+    updateDB((prev) => ({ ...prev, vendors: prev.vendors.filter((_, i) => !dupSet.has(i)) }));
+  }
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -75,34 +124,67 @@ export default function Vendors() {
     setModalOpen(false);
   }
 
+  // Any other pending submissions that share this one's identity (PAN/mobile) —
+  // i.e. the same vendor submitted the form more than once.
+  function siblingDuplicates(sub) {
+    const key = identityKey(sub.data || {});
+    return pendingSubs.filter((s) => s.id !== sub.id && identityKey(s.data || {}) === key);
+  }
+
   async function approve(sub) {
     const d = sub.data || {};
-    const vendor = {
-      vendorType: d.vendorType || (d.gst ? 'gst' : 'nogst'),
-      cat: d.cat || 'Other',
-      name: d.name || '', biz: d.biz || '', mobile: d.mobile || '', email: d.email || '',
-      pan: d.pan || '', gst: d.gst || '', bank: d.bank || '', acc: d.acc || '',
-      ifsc: d.ifsc || '', branch: d.branch || '', accName: d.accName || '', upi: d.upi || '',
-      aadhaarDoc: d.aadhaarDoc || '',
-    };
-    updateDB((prev) => ({ ...prev, vendors: [...prev.vendors, vendor] }));
+    const key = identityKey(d);
+    const alreadyExists = DB.vendors.some((v) => identityKey(v) === key);
+
+    if (!alreadyExists) {
+      const vendor = {
+        vendorType: d.vendorType || (d.gst ? 'gst' : 'nogst'),
+        cat: d.cat || 'Other',
+        name: d.name || '', biz: d.biz || '', mobile: d.mobile || '', email: d.email || '',
+        pan: d.pan || '', gst: d.gst || '', bank: d.bank || '', acc: d.acc || '',
+        ifsc: d.ifsc || '', branch: d.branch || '', accName: d.accName || '', upi: d.upi || '',
+        aadhaarDoc: d.aadhaarDoc || '',
+      };
+      updateDB((prev) => ({ ...prev, vendors: [...prev.vendors, vendor] }));
+    }
+
+    const dupes = siblingDuplicates(sub);
     try {
       await markSubmissionStatus(sub.id, 'approved', d);
+      // Resolve any duplicate submissions of the same vendor so they don't
+      // linger in the pending queue or get separately approved into a
+      // second vendor record.
+      await Promise.all(dupes.map((dup) => markSubmissionStatus(dup.id, 'duplicate', dup.data || {})));
       loadSubmissions();
     } catch (e) {
       console.error(e);
-      alert('Vendor was added, but marking the submission as approved failed. You can safely ignore or retry.');
+      alert('Vendor was added, but marking the submission (or its duplicates) as approved failed. You can safely ignore or retry.');
     }
   }
 
   async function reject(sub) {
     if (!confirm('Reject this submission? It will stay in the list marked as rejected.')) return;
+    const dupes = siblingDuplicates(sub);
     try {
       await markSubmissionStatus(sub.id, 'rejected', sub.data || {});
+      await Promise.all(dupes.map((dup) => markSubmissionStatus(dup.id, 'duplicate', dup.data || {})));
       loadSubmissions();
     } catch (e) {
       console.error(e);
       alert('Could not update this submission — try again.');
+    }
+  }
+
+  async function cleanUpAllDuplicates() {
+    const dupes = pendingGroups.flatMap((g) => g.duplicates);
+    if (dupes.length === 0) return;
+    if (!confirm(`Mark ${dupes.length} duplicate submission(s) as resolved? The most recent copy of each vendor stays in the queue.`)) return;
+    try {
+      await Promise.all(dupes.map((dup) => markSubmissionStatus(dup.id, 'duplicate', dup.data || {})));
+      loadSubmissions();
+    } catch (e) {
+      console.error(e);
+      alert('Could not clean up duplicates — try again.');
     }
   }
 
@@ -142,27 +224,44 @@ export default function Vendors() {
           <div className="flex items-center gap-2 text-[13px] font-semibold text-ink dark:text-white">
             <Inbox size={15} className="text-brass-500" />
             Pending Vendor Submissions
-            {pendingSubs.length > 0 && (
-              <span className="rounded-full bg-brass-500 px-2 py-0.5 text-[11px] font-bold text-white">{pendingSubs.length}</span>
+            {pendingGroups.length > 0 && (
+              <span className="rounded-full bg-brass-500 px-2 py-0.5 text-[11px] font-bold text-white">{pendingGroups.length}</span>
             )}
           </div>
-          <Button size="sm" onClick={loadSubmissions}>{subsLoading ? 'Loading…' : 'Refresh'}</Button>
+          <div className="flex items-center gap-2">
+            {duplicateCount > 0 && (
+              <Button size="sm" variant="ghost" onClick={cleanUpAllDuplicates}>
+                Clean up {duplicateCount} duplicate{duplicateCount === 1 ? '' : 's'}
+              </Button>
+            )}
+            <Button size="sm" onClick={loadSubmissions}>{subsLoading ? 'Loading…' : 'Refresh'}</Button>
+          </div>
         </div>
 
         {subsError ? (
           <div className="px-5 py-8 text-center text-[13px] text-rose-500">{subsError}</div>
-        ) : pendingSubs.length === 0 ? (
+        ) : pendingGroups.length === 0 ? (
           <div className="px-5 py-10 text-center text-[13px] text-ink/40 dark:text-white/40">
             No pending submissions from the vendor registration form right now.
           </div>
         ) : (
           <div className="divide-y divide-ink/10 dark:divide-white/10">
-            {pendingSubs.map((sub) => {
+            {pendingGroups.map(({ primary: sub, duplicates }) => {
               const d = sub.data || {};
               return (
                 <div key={sub.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
                   <div>
-                    <div className="font-medium text-ink dark:text-white">{d.biz || d.name || 'Unnamed vendor'}</div>
+                    <div className="flex items-center gap-2">
+                      <div className="font-medium text-ink dark:text-white">{d.biz || d.name || 'Unnamed vendor'}</div>
+                      {duplicates.length > 0 && (
+                        <span
+                          title={`Submitted ${duplicates.length + 1} times — showing the most recent copy`}
+                          className="rounded-full bg-rose-500/10 px-2 py-0.5 text-[10px] font-semibold text-rose-500"
+                        >
+                          {duplicates.length + 1}× submitted
+                        </span>
+                      )}
+                    </div>
                     <div className="mt-0.5 text-xs text-ink/50 dark:text-white/45">
                       {d.name}{d.name && d.mobile ? ' · ' : ''}{d.mobile}{d.email ? ' · ' + d.email : ''}
                     </div>
@@ -189,6 +288,11 @@ export default function Vendors() {
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-ink/10 px-5 py-3.5 dark:border-white/10">
           <div className="text-[13px] font-semibold text-ink dark:text-white">All Vendors</div>
           <div className="flex items-center gap-2">
+            {duplicateVendorIdx.length > 0 && (
+              <Button size="sm" variant="ghost" onClick={removeDuplicateVendors}>
+                Remove {duplicateVendorIdx.length} duplicate{duplicateVendorIdx.length === 1 ? '' : 's'}
+              </Button>
+            )}
             <input
               placeholder="Search vendors…"
               value={search}
