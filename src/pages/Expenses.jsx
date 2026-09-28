@@ -1,9 +1,10 @@
-import { useMemo, useRef, useState } from 'react';
-import { Wallet, Plus, Pencil, Trash2, CreditCard, X as XIcon, FileText, Wrench, Eye, Download, Upload, Paperclip, FileX } from 'lucide-react';
+import { Fragment, useMemo, useRef, useState } from 'react';
+import { Wallet, Plus, Pencil, Trash2, CreditCard, X as XIcon, FileText, Wrench, Eye, Download, Upload, Paperclip, FileX, Landmark, AlertTriangle, CheckCircle2, Square, CheckSquare } from 'lucide-react';
 import { useDB } from '../context/DBContext.jsx';
 import { fmt, fmtDate, todayISO, uid } from '../lib/utils.js';
 import { printVendorStatement } from '../lib/vendorStatement.js';
 import { compressBillFile } from '../lib/fileCompress.js';
+import { buildICICIBulkFile, downloadBulkFile, validatePayoutItem, validateCompanyBankDetails, findVendorRecord } from '../lib/bankPaymentFile.js';
 import JSZip from 'jszip';
 import Modal from '../components/ui/Modal.jsx';
 import Button from '../components/ui/Button.jsx';
@@ -23,9 +24,23 @@ function emptyExpense() {
 }
 
 /** Opens a stored bill (compressed JPEG data URL) in a new tab. */
+// Browsers block navigating a new tab straight to a data: URL (it opens blank),
+// so convert to a Blob and open a blob: URL instead.
+function dataUrlToBlob(dataUrl) {
+  const [meta, b64] = dataUrl.split(',');
+  const mime = meta.match(/:(.*?);/)?.[1] || 'image/jpeg';
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+
 function viewBill(billFile) {
   if (!billFile) return;
-  window.open(billFile.dataUrl, '_blank');
+  const url = URL.createObjectURL(dataUrlToBlob(billFile.dataUrl));
+  const w = window.open(url, '_blank');
+  if (!w) alert('Your browser blocked the popup — allow popups for this site and try again.');
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
 /** Downloads a stored bill to disk. */
@@ -135,9 +150,12 @@ export default function Expenses() {
     try {
       const compressed = await compressBillFile(file);
       setForm((f) => ({ ...f, billFile: { ...compressed, uploadDate: todayISO() } }));
+      if (compressed.totalPages > compressed.pages) {
+        alert(`This PDF has ${compressed.totalPages} pages — only the first ${compressed.pages} were saved.`);
+      }
     } catch (err) {
       console.error(err);
-      alert('Could not process that file — try a different image or PDF.');
+      alert('Could not process that file: ' + (err?.message || 'unknown error') + '\n\nTry a different image or PDF.');
     } finally {
       setCompressingBill(false);
     }
@@ -162,12 +180,15 @@ export default function Expenses() {
         <button onClick={() => setView('list')} className={`px-4 py-2 text-[13px] font-medium border-b-2 -mb-px transition-colors ${view === 'list' ? 'border-brass-500 text-ink dark:text-white' : 'border-transparent text-ink/40 dark:text-white/40'}`}>Expenses</button>
         <button onClick={() => setView('vendor')} className={`px-4 py-2 text-[13px] font-medium border-b-2 -mb-px transition-colors ${view === 'vendor' ? 'border-brass-500 text-ink dark:text-white' : 'border-transparent text-ink/40 dark:text-white/40'}`}>Vendor Payments</button>
         <button onClick={() => setView('bills')} className={`px-4 py-2 text-[13px] font-medium border-b-2 -mb-px transition-colors ${view === 'bills' ? 'border-brass-500 text-ink dark:text-white' : 'border-transparent text-ink/40 dark:text-white/40'}`}>Vendor Bills</button>
+        <button onClick={() => setView('pay')} className={`px-4 py-2 text-[13px] font-medium border-b-2 -mb-px transition-colors ${view === 'pay' ? 'border-brass-500 text-ink dark:text-white' : 'border-transparent text-ink/40 dark:text-white/40'}`}>Bank Payments</button>
       </div>
 
       {view === 'bills' ? (
         <BillsArchiveView DB={DB} />
       ) : view === 'vendor' ? (
         <VendorPaymentsView DB={DB} vendorFilter={vendorFilter} setVendorFilter={setVendorFilter} />
+      ) : view === 'pay' ? (
+        <BankPaymentsView DB={DB} updateDB={updateDB} />
       ) : (
       <>
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -341,7 +362,7 @@ export default function Expenses() {
               <img src={form.billFile.dataUrl} alt="Bill" className="h-16 w-16 flex-shrink-0 rounded-lg border border-ink/10 object-cover dark:border-white/10" />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-xs font-medium text-ink dark:text-white">{form.billFile.name}</div>
-                <div className="text-[11px] text-ink/40 dark:text-white/35">~{form.billFile.sizeKB} KB{form.billFile.wasPdf ? ' · converted from PDF' : ''}</div>
+                <div className="text-[11px] text-ink/40 dark:text-white/35">~{form.billFile.sizeKB} KB{form.billFile.wasPdf ? ` · PDF, ${form.billFile.pages} of ${form.billFile.totalPages} page${form.billFile.totalPages > 1 ? 's' : ''} saved` : ''}</div>
               </div>
               <Button size="sm" onClick={() => viewBill(form.billFile)}><Eye size={14} /> View</Button>
               <Button size="sm" onClick={() => downloadBill(form.billFile)}><Download size={14} /></Button>
@@ -513,6 +534,327 @@ function VendorPaymentsView({ DB, vendorFilter, setVendorFilter }) {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+/**
+ * "Option A" bank payment flow: pick which unpaid/partial vendor expenses
+ * to pay, generate an ICICI bulk-upload CSV (you still upload & approve it
+ * yourself in CIB netbanking — this never talks to the bank directly), then
+ * batch-confirm them as paid once you've actually sent the money.
+ */
+function BankPaymentsView({ DB, updateDB }) {
+  const [selected, setSelected] = useState(() => new Set());
+  const [overrides, setOverrides] = useState({}); // { [expenseIdx]: { beneAcc, ifsc, beneName, beneEmail, beneMobile, saveToVendor } }
+  const [payAmounts, setPayAmounts] = useState({}); // { [expenseIdx]: string }
+  const [editingBank, setEditingBank] = useState(null); // expenseIdx currently showing the inline bank-detail form
+  const [generating, setGenerating] = useState(false);
+
+  const payable = useMemo(() => {
+    return DB.expenses
+      .map((e, idx) => ({ e, idx, ...computeStatus(e.amt, e.paymentSplits) }))
+      .filter(({ bal }) => bal > 0.005)
+      .sort((a, b) => (a.e.date || '').localeCompare(b.e.date || ''));
+  }, [DB.expenses]);
+
+  function bankInfoFor(idx, e) {
+    const ov = overrides[idx];
+    if (ov) return ov;
+    const match = findVendorRecord(DB, e.vendor);
+    const v = match?.vendor;
+    return {
+      beneAcc: v?.acc || '', ifsc: v?.ifsc || '', beneName: v?.accName || v?.biz || v?.name || e.vendor || '',
+      beneEmail: v?.email || '', beneMobile: v?.mobile || '',
+    };
+  }
+
+  function toggle(idx) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx); else next.add(idx);
+      return next;
+    });
+  }
+
+  function saveBankOverride(idx, fields, alsoSaveToVendor, vendorName) {
+    setOverrides((prev) => ({ ...prev, [idx]: fields }));
+    setEditingBank(null);
+    if (alsoSaveToVendor && vendorName) {
+      updateDB((prev) => {
+        const match = findVendorRecord(prev, vendorName);
+        const vendors = [...prev.vendors];
+        if (match) {
+          vendors[match.idx] = { ...vendors[match.idx], acc: fields.beneAcc, ifsc: fields.ifsc.toUpperCase(), accName: fields.beneName };
+        } else {
+          vendors.push({
+            vendorType: 'nogst', cat: 'Other', name: vendorName, biz: vendorName, mobile: fields.beneMobile || '', email: fields.beneEmail || '',
+            pan: '', gst: '', bank: '', acc: fields.beneAcc, ifsc: fields.ifsc.toUpperCase(), branch: '', accName: fields.beneName, upi: '',
+          });
+        }
+        return { ...prev, vendors };
+      });
+    }
+  }
+
+  const selectedItems = payable.filter(({ idx }) => selected.has(idx));
+  const selectedTotal = selectedItems.reduce((s, { idx }) => s + (parseFloat(payAmounts[idx] ?? '') || 0), 0);
+
+  function generateFile() {
+    if (selectedItems.length === 0) { alert('Select at least one payment to include.'); return; }
+
+    const companyProblems = validateCompanyBankDetails(DB.settings);
+    if (companyProblems.length) { alert(companyProblems.join('\n')); return; }
+
+    const lines = [];
+    const fileItems = [];
+    for (const { idx, e, bal } of selectedItems) {
+      const info = bankInfoFor(idx, e);
+      const amount = parseFloat(payAmounts[idx] ?? bal) || 0;
+      const problems = validatePayoutItem({ ...info, amount });
+      if (problems.length) lines.push(`• ${e.vendor || e.desc}: ${problems.join(', ')}`);
+      fileItems.push({ idx, e, amount, info });
+    }
+    if (lines.length) {
+      alert('Fix these before generating the file:\n\n' + lines.join('\n'));
+      return;
+    }
+    if (fileItems.some(({ amount, e }) => amount > (parseFloat(e.amt) || 0) + 0.01)) {
+      if (!confirm('One or more pay amounts exceed the expense total. Continue anyway?')) return;
+    }
+
+    setGenerating(true);
+    try {
+      const batchNo = `PB-${(DB.paymentBatches?.length || 0) + 1}`;
+      const { content, filename, totalAmount, rowCount } = buildICICIBulkFile(
+        fileItems.map(({ e, amount, info }) => ({
+          beneAcc: info.beneAcc, ifsc: info.ifsc, beneName: info.beneName,
+          amount,
+          remarksClient: e.vendor || 'Vendor',
+          remarksBeneficiary: `${e.vendor || ''} ${e.billno || ''}`.trim() || e.desc,
+        })),
+        DB.settings,
+        batchNo
+      );
+      downloadBulkFile(content, filename);
+
+      const batch = {
+        id: uid(), no: batchNo, date: todayISO(), status: 'file_generated',
+        totalAmount, rowCount, filename,
+        items: fileItems.map(({ idx, e, amount }) => ({ expenseIdx: idx, desc: e.desc, vendor: e.vendor, amt: e.amt, payAmount: amount })),
+      };
+      updateDB((prev) => ({ ...prev, paymentBatches: [...(prev.paymentBatches || []), batch] }));
+      setSelected(new Set());
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+
+  function markBatchPaid(batchId) {
+    const batch = DB.paymentBatches.find((b) => b.id === batchId);
+    if (!batch) return;
+    if (!confirm(`Mark all ${batch.items.length} payment(s) in ${batch.no} as paid? Only do this after the transfer is actually completed in ICICI netbanking.`)) return;
+
+    const mismatched = [];
+    updateDB((prev) => {
+      const expenses = [...prev.expenses];
+      batch.items.forEach((it) => {
+        const exp = expenses[it.expenseIdx];
+        const stillMatches = exp && exp.desc === it.desc && exp.vendor === it.vendor && String(exp.amt) === String(it.amt);
+        if (!stillMatches) { mismatched.push(it); return; }
+        const split = { id: uid(), amt: it.payAmount, date: todayISO(), mode: 'Bank Transfer', paidBy: 'Company', ref: `ICICI ${batch.no}` };
+        expenses[it.expenseIdx] = { ...exp, paymentSplits: [...(exp.paymentSplits || []), split] };
+      });
+      const paymentBatches = prev.paymentBatches.map((b) => b.id === batchId
+        ? { ...b, status: mismatched.length ? 'completed_with_issues' : 'completed', markedPaidAt: todayISO() }
+        : b);
+      return { ...prev, expenses, paymentBatches };
+    });
+
+    if (mismatched.length) {
+      alert(`${mismatched.length} item(s) in this batch no longer match the original expense (probably edited/deleted since the file was generated) and were skipped — please mark those paid manually:\n\n` +
+        mismatched.map((m) => `• ${m.vendor || m.desc}`).join('\n'));
+    }
+  }
+
+  function cancelBatch(batchId) {
+    if (!confirm('Cancel this batch? This just removes the record — nothing was sent to the bank.')) return;
+    updateDB((prev) => ({ ...prev, paymentBatches: prev.paymentBatches.filter((b) => b.id !== batchId) }));
+  }
+
+  const batchStatusClass = (st) => ({
+    file_generated: 'bg-brass-50 text-brass-600 dark:bg-brass-500/10 dark:text-brass-400',
+    completed: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400',
+    completed_with_issues: 'bg-rose-50 text-rose-600 dark:bg-rose-500/10 dark:text-rose-400',
+  }[st] || 'bg-ink/5 text-ink/50 dark:bg-white/10 dark:text-white/45');
+
+  return (
+    <div>
+      <div className="rounded-lg border border-brass-400/30 bg-brass-50 px-4 py-3 text-xs text-brass-700 dark:border-brass-400/20 dark:bg-brass-500/10 dark:text-brass-400">
+        This generates a bulk payment file for ICICI netbanking — it does <strong>not</strong> move money itself. Download the file, upload &amp; approve it yourself in ICICI Corporate Internet Banking, then come back and mark the batch as paid.
+      </div>
+
+      <div className="mt-5 overflow-hidden rounded-xl border border-ink/10 bg-white shadow-card dark:border-white/10 dark:bg-noir-soft">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-ink/10 px-5 py-3.5 dark:border-white/10">
+          <div className="text-[13px] font-semibold text-ink dark:text-white">Vendor Dues — Select Payments to Include</div>
+          <div className="flex items-center gap-3 text-xs text-ink/50 dark:text-white/40">
+            {selectedItems.length > 0 && <span>{selectedItems.length} selected · ₹{fmt(selectedTotal)}</span>}
+            <Button variant="primary" size="sm" onClick={generateFile} disabled={selectedItems.length === 0 || generating}>
+              <Landmark size={14} /> {generating ? 'Generating…' : 'Generate ICICI Payment File'}
+            </Button>
+          </div>
+        </div>
+
+        {payable.length === 0 ? (
+          <div className="flex flex-col items-center gap-2 px-6 py-16 text-center">
+            <CheckCircle2 size={26} strokeWidth={1.5} className="text-ink/30 dark:text-white/30" />
+            <div className="text-[13px] text-ink/45 dark:text-white/45">No outstanding vendor dues — everything's paid up.</div>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-[13px]">
+              <thead>
+                <tr className="border-b border-ink/10 text-[10px] uppercase tracking-wider text-ink/40 dark:border-white/10 dark:text-white/35">
+                  <th className="px-5 py-2.5 font-medium"></th>
+                  <th className="px-5 py-2.5 font-medium">Vendor</th>
+                  <th className="px-5 py-2.5 font-medium">Description</th>
+                  <th className="px-5 py-2.5 font-medium">Due</th>
+                  <th className="px-5 py-2.5 font-medium">Pay Amount</th>
+                  <th className="px-5 py-2.5 font-medium">Bank Details</th>
+                  <th className="px-5 py-2.5 font-medium">Mode</th>
+                </tr>
+              </thead>
+              <tbody>
+                {payable.map(({ e, idx, bal }) => {
+                  const info = bankInfoFor(idx, e);
+                  const amount = parseFloat(payAmounts[idx] ?? bal.toFixed(2));
+                  const problems = validatePayoutItem({ ...info, amount });
+                  const isSelected = selected.has(idx);
+                  return (
+                    <Fragment key={idx}>
+                      <tr className="border-b border-ink/5 last:border-0 dark:border-white/5">
+                        <td className="px-5 py-3">
+                          <button onClick={() => toggle(idx)} className="text-ink/40 hover:text-ink dark:text-white/40 dark:hover:text-white">
+                            {isSelected ? <CheckSquare size={16} /> : <Square size={16} />}
+                          </button>
+                        </td>
+                        <td className="px-5 py-3 text-ink/70 dark:text-white/70">{e.vendor || '—'}</td>
+                        <td className="px-5 py-3 text-ink/70 dark:text-white/70">{e.desc}</td>
+                        <td className="px-5 py-3 text-ink/70 dark:text-white/70">₹{fmt(bal)}</td>
+                        <td className="px-5 py-3">
+                          <Input
+                            type="number" value={payAmounts[idx] ?? bal.toFixed(2)}
+                            onChange={(ev) => setPayAmounts((prev) => ({ ...prev, [idx]: ev.target.value }))}
+                            className="!w-28 py-1.5 text-xs"
+                          />
+                        </td>
+                        <td className="px-5 py-3">
+                          {problems.length === 0 ? (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400">
+                              <CheckCircle2 size={11} /> A/C …{info.beneAcc.slice(-4)}
+                            </span>
+                          ) : (
+                            <button onClick={() => setEditingBank(idx)} className="inline-flex items-center gap-1 rounded-full bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-500 hover:bg-rose-100 dark:bg-rose-500/10 dark:text-rose-400/80">
+                              <AlertTriangle size={11} /> {editingBank === idx ? 'Editing…' : 'Add bank details'}
+                            </button>
+                          )}
+                        </td>
+                        <td className="px-5 py-3 text-xs text-ink/50 dark:text-white/40">{amount >= 200000 ? 'RTGS' : 'NEFT'}</td>
+                      </tr>
+                      {editingBank === idx && (
+                        <tr className="border-b border-ink/5 bg-ink/[0.02] dark:border-white/5 dark:bg-white/[0.02]">
+                          <td colSpan={7} className="px-5 py-4">
+                            <InlineBankForm
+                              initial={info}
+                              vendorName={e.vendor}
+                              onCancel={() => setEditingBank(null)}
+                              onSave={(fields, alsoSave) => saveBankOverride(idx, fields, alsoSave, e.vendor)}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {(DB.paymentBatches || []).length > 0 && (
+        <div className="mt-5 overflow-hidden rounded-xl border border-ink/10 bg-white shadow-card dark:border-white/10 dark:bg-noir-soft">
+          <div className="border-b border-ink/10 px-5 py-3.5 text-[13px] font-semibold text-ink dark:border-white/10 dark:text-white">Payment Batches</div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-[13px]">
+              <thead>
+                <tr className="border-b border-ink/10 text-[10px] uppercase tracking-wider text-ink/40 dark:border-white/10 dark:text-white/35">
+                  <th className="px-5 py-2.5 font-medium">Batch</th>
+                  <th className="px-5 py-2.5 font-medium">Date</th>
+                  <th className="px-5 py-2.5 font-medium">Items</th>
+                  <th className="px-5 py-2.5 font-medium">Total</th>
+                  <th className="px-5 py-2.5 font-medium">Status</th>
+                  <th className="px-5 py-2.5 font-medium">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...DB.paymentBatches].reverse().map((b) => (
+                  <tr key={b.id} className="border-b border-ink/5 last:border-0 dark:border-white/5">
+                    <td className="px-5 py-3 font-mono text-xs text-ink/70 dark:text-white/70">{b.no}</td>
+                    <td className="px-5 py-3 font-mono text-xs text-ink/70 dark:text-white/70">{fmtDate(b.date)}</td>
+                    <td className="px-5 py-3 text-ink/70 dark:text-white/70">{b.rowCount}</td>
+                    <td className="px-5 py-3 text-ink/70 dark:text-white/70">₹{fmt(b.totalAmount)}</td>
+                    <td className="px-5 py-3">
+                      <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${batchStatusClass(b.status)}`}>
+                        {b.status === 'file_generated' ? 'File Downloaded' : b.status === 'completed' ? 'Paid' : 'Paid (with issues)'}
+                      </span>
+                    </td>
+                    <td className="px-5 py-3">
+                      <div className="flex items-center gap-1.5">
+                        {b.status === 'file_generated' && (
+                          <>
+                            <Button size="sm" variant="primary" onClick={() => markBatchPaid(b.id)}><CheckCircle2 size={13} /> Mark as Paid</Button>
+                            <Button size="sm" variant="danger" onClick={() => cancelBatch(b.id)}><Trash2 size={13} /></Button>
+                          </>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Small inline form for entering/fixing a payee's bank details on the spot. */
+function InlineBankForm({ initial, vendorName, onSave, onCancel }) {
+  const [fields, setFields] = useState({
+    beneName: initial.beneName || vendorName || '', beneAcc: initial.beneAcc || '', ifsc: initial.ifsc || '',
+    beneEmail: initial.beneEmail || '', beneMobile: initial.beneMobile || '',
+  });
+  const [alsoSave, setAlsoSave] = useState(true);
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <Field label="Account Holder Name"><Input value={fields.beneName} onChange={(e) => setFields((f) => ({ ...f, beneName: e.target.value }))} /></Field>
+        <Field label="Account Number"><Input value={fields.beneAcc} onChange={(e) => setFields((f) => ({ ...f, beneAcc: e.target.value }))} /></Field>
+        <Field label="IFSC Code"><Input value={fields.ifsc} onChange={(e) => setFields((f) => ({ ...f, ifsc: e.target.value.toUpperCase() }))} /></Field>
+        <Field label="Mobile (optional)"><Input value={fields.beneMobile} onChange={(e) => setFields((f) => ({ ...f, beneMobile: e.target.value }))} /></Field>
+      </div>
+      <label className="flex items-center gap-2 text-xs text-ink/60 dark:text-white/50">
+        <input type="checkbox" checked={alsoSave} onChange={(e) => setAlsoSave(e.target.checked)} />
+        Also save these details to the vendor record so they're pre-filled next time
+      </label>
+      <div className="flex justify-end gap-2">
+        <Button size="sm" onClick={onCancel}>Cancel</Button>
+        <Button size="sm" variant="primary" onClick={() => onSave(fields, alsoSave)}>Save</Button>
+      </div>
     </div>
   );
 }

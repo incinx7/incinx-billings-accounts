@@ -7,6 +7,7 @@ export function emptyDB() {
   return {
     invoices: [], clients: [], vendors: [], projects: [], expenses: [], petty: [],
     quotations: [], proforma: [], expo: [], gstBills: [], informal: [],
+    paymentBatches: [],
     pin: '',
     settings: {
       gstin: '', pan: '', hsn: '', companyName: 'My Company', address: '', city: '',

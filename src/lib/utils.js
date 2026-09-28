@@ -169,7 +169,7 @@ export function expenseGstBills(expenses) {
         vendor: e.vendor, gst: e.vgst, pan: e.vpan, billNo: e.billno,
         billDate: e.date, billMonth: (e.date || '').slice(0, 7),
         taxableAmt: baseAmt, gstAmt, amount: amt,
-        type: e.billFile.wasPdf ? 'application/pdf' : 'image/jpeg',
+        type: 'image/jpeg', // stored bills are always compressed JPEGs, even when the original was a PDF
         data: e.billFile.dataUrl, name: e.billFile.name,
         expenseIndex: i,
       };

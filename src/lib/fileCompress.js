@@ -2,7 +2,7 @@
 // before it gets stored in the DB blob. Keeps every bill copy lightweight
 // regardless of how big the original photo/scan was.
 
-import { pdfFirstPageToImage } from './pdfToImage.js';
+import { pdfPagesToImage } from './pdfToImage.js';
 
 /**
  * Loads a File/Blob into an HTMLImageElement.
@@ -21,8 +21,12 @@ function loadImage(file) {
  * Draws an image onto a canvas, scaled down so its longest side is at most
  * maxDim, and returns a compressed JPEG data URL.
  */
-function drawToJpeg(img, maxDim, quality) {
-  const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+function drawToJpeg(img, { maxDim, maxWidth }, quality) {
+  // Photos are limited by their longest side; stitched multi-page PDFs are
+  // very tall, so those are limited by width instead (else text turns to mush).
+  const scale = maxWidth
+    ? Math.min(1, maxWidth / img.width)
+    : Math.min(1, maxDim / Math.max(img.width, img.height));
   const w = Math.max(1, Math.round(img.width * scale));
   const h = Math.max(1, Math.round(img.height * scale));
 
@@ -46,29 +50,43 @@ function dataUrlSizeKB(dataUrl) {
 
 /**
  * Compresses a bill file (image or PDF) into a small JPEG data URL.
- * PDFs are rasterized to their first page first, then compressed the same
- * way — so every stored bill is a consistent, lightweight JPEG.
+ * PDFs: up to the first 3 pages are rendered, stitched top-to-bottom into
+ * one image, then compressed hard (target ~250 KB total) so the DB blob
+ * stays light. Photos target ~150 KB.
  *
- * Tries progressively smaller sizes/quality until under targetKB, so a
- * huge phone photo doesn't end up as a multi-MB attachment.
+ * Tries progressively smaller sizes/quality until under targetKB.
  *
- * Returns { dataUrl, name, sizeKB, wasPdf }.
+ * Returns { dataUrl, name, sizeKB, wasPdf, pages, totalPages }.
  */
-export async function compressBillFile(file, { targetKB = 150 } = {}) {
+export async function compressBillFile(file, { maxPdfPages = 3 } = {}) {
   const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name || '');
-  const sourceFile = isPdf ? await pdfFirstPageToImage(file) : file;
+
+  let sourceFile = file, pages = 1, totalPages = 1;
+  if (isPdf) {
+    const r = await pdfPagesToImage(file, { maxPages: maxPdfPages });
+    sourceFile = r.file; pages = r.usedPages; totalPages = r.totalPages;
+  }
   const img = await loadImage(sourceFile);
 
-  const attempts = [
-    { maxDim: 1600, quality: 0.7 },
-    { maxDim: 1200, quality: 0.6 },
-    { maxDim: 1000, quality: 0.5 },
-    { maxDim: 800, quality: 0.4 },
-  ];
+  const attempts = isPdf
+    ? [
+        { maxWidth: 1000, quality: 0.55 },
+        { maxWidth: 900, quality: 0.5 },
+        { maxWidth: 800, quality: 0.45 },
+        { maxWidth: 700, quality: 0.4 },
+        { maxWidth: 600, quality: 0.35 },
+      ]
+    : [
+        { maxDim: 1600, quality: 0.7 },
+        { maxDim: 1200, quality: 0.6 },
+        { maxDim: 1000, quality: 0.5 },
+        { maxDim: 800, quality: 0.4 },
+      ];
+  const targetKB = isPdf ? 250 : 150;
 
-  let dataUrl = drawToJpeg(img, attempts[0].maxDim, attempts[0].quality);
+  let dataUrl = '';
   for (const a of attempts) {
-    dataUrl = drawToJpeg(img, a.maxDim, a.quality);
+    dataUrl = drawToJpeg(img, a, a.quality);
     if (dataUrlSizeKB(dataUrl) <= targetKB) break;
   }
 
@@ -77,5 +95,7 @@ export async function compressBillFile(file, { targetKB = 150 } = {}) {
     name: (file.name || 'bill').replace(/\.pdf$/i, '.jpg'),
     sizeKB: dataUrlSizeKB(dataUrl),
     wasPdf: isPdf,
+    pages,
+    totalPages,
   };
 }
